@@ -3,7 +3,7 @@ emacs-regex-lookaround
 
 This patch will add the lookahead & lookbehind assertions to Emacs24.2 regular expressions.
 
-cd emacs
+cd emacs  
 patch -b -p0 < ../emacs-24.2-regex.patch
 
 then compile Emacs.
