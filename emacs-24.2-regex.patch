@@ -1,0 +1,459 @@
+--- src/regex.c	2012-08-23 13:33:42.000000000 +0800
++++ src/regex.c	2013-02-04 21:15:08.320351000 +0800
+@@ -673,8 +673,15 @@
+   syntaxspec,
+ 
+ 	/* Matches any character whose syntax is not that specified.  */
+-  notsyntaxspec
++  notsyntaxspec,
+ 
++  lookahead,
++  lookahead_not,
++  lookbehind,
++  lookbehind_not,
++  lookaround_succeed,
++  lookaround_fail
++  
+ #ifdef emacs
+   ,before_dot,	/* Succeeds if before point.  */
+   at_dot,	/* Succeeds if at point.  */
+@@ -966,6 +973,36 @@
+ 	  fprintf (stderr, "/stop_memory/%d", *p++);
+ 	  break;
+ 
++        case lookahead:
++          extract_number_and_incr (&mcnt, &p);
++          fprintf (stderr, "/lookahead/%d", mcnt);
++          break;
++
++        case lookahead_not:
++          extract_number_and_incr (&mcnt, &p);
++          fprintf (stderr, "/lookahead_not/%d", mcnt);
++          break;
++
++        case lookbehind:
++          extract_number_and_incr (&mcnt, &p);
++          extract_number_and_incr (&mcnt2, &p);
++          fprintf (stderr, "/lookbehind/%d/%d", mcnt, mcnt2);
++          break;
++
++        case lookbehind_not:
++          extract_number_and_incr (&mcnt, &p);
++          extract_number_and_incr (&mcnt2, &p);
++          fprintf (stderr, "/lookbehind_not/%d/%d", mcnt, mcnt2);
++          break;
++
++        case lookaround_succeed:
++	  fprintf (stderr, "/lookaround_succeed");
++          break;
++
++        case lookaround_fail:
++          fprintf (stderr, "/lookaround_fail");
++          break;
++
+ 	case duplicate:
+ 	  fprintf (stderr, "/duplicate/%d", *p++);
+ 	  break;
+@@ -1529,11 +1566,17 @@
+     }									\
+   else									\
+     {									\
+-      regend[pfreg] = POP_FAILURE_POINTER ();				\
+-      regstart[pfreg] = POP_FAILURE_POINTER ();				\
+-      DEBUG_PRINT4 ("     Pop reg %d (spanning %p -> %p)\n",		\
+-		    pfreg, regstart[pfreg], regend[pfreg]);		\
+-    }									\
++      re_char *start, *end;                                             \
++      end = POP_FAILURE_POINTER ();                                     \
++      start = POP_FAILURE_POINTER ();                                   \
++      if (!discard_saved_regs)                                          \
++        {                                                               \
++          regstart[reg] = start;                                        \
++          regend[reg] = end;                                            \
++          DEBUG_PRINT4 ("     Pop reg %d (spanning %p -> %p)\n",        \
++                        reg, regstart[reg], regend[reg]);               \
++        }                                                               \
++    }                                                                   \
+ } while (0)
+ 
+ /* Check that we are not stuck in an infinite loop.  */
+@@ -1652,6 +1695,29 @@
+   DEBUG_STATEMENT (nfailure_points_popped++);				\
+ } while (0) /* POP_FAILURE_POINT */
+ 
++#define FINISH_LOOKAROUND()                                     \
++  do {                                                          \
++    re_char *str, *pat;                                         \
++    re_opcode_t op;                                             \
++    discard_saved_regs = 1;                                     \
++    while (!FAIL_STACK_EMPTY ())                                \
++      {                                                         \
++        POP_FAILURE_POINT (str, pat);                           \
++        op = (re_opcode_t) *pat;                                \
++        if (op == lookahead                                     \
++            || op == lookahead_not                              \
++            || op == lookbehind                                 \
++            || op == lookbehind_not)                            \
++          {                                                     \
++            d = str;                                            \
++            dend = ((d >= string1 && d <= end1)                 \
++                    ? end_match_1 : end_match_2);               \
++            break;                                              \
++          }                                                     \
++      }                                                         \
++    discard_saved_regs = 0;                                     \
++  } while (0);
++
+ 
+ 
+ /* Registers are set to a sentinel when they haven't yet matched.  */
+@@ -1841,6 +1907,7 @@
+   pattern_offset_t fixup_alt_jump;
+   pattern_offset_t laststart_offset;
+   regnum_t regnum;
++  int lookaround;
+ } compile_stack_elt_t;
+ 
+ 
+@@ -2433,6 +2500,8 @@
+ 						 compile_stack,
+ 						 regnum_t regnum));
+ 
++static int exact_chars_in_pattern_buffer _RE_ARGS ((struct re_pattern_buffer *bufp, re_char *p, re_char *pend));
++
+ /* `regex_compile' compiles PATTERN (of length SIZE) according to SYNTAX.
+    Returns one of error codes defined in `regex.h', or zero for success.
+ 
+@@ -3168,6 +3237,7 @@
+ 	    handle_open:
+ 	      {
+ 		int shy = 0;
++                int lookaround = 0;
+ 		regnum_t regnum = 0;
+ 		if (p+1 < pend)
+ 		  {
+@@ -3189,6 +3259,27 @@
+ 			      case '1': case '2': case '3': case '4':
+ 			      case '5': case '6': case '7': case '8': case '9':
+ 				regnum = 10*regnum + (c - '0'); break;
++                              case '=':
++                                /* Positive lookahead assertion.  */
++                                shy = lookaround = 1;
++                                break;
++                              case '!':
++                                /* Negative lookahead assertion.  */
++                                shy = lookaround = 2;
++                                break;
++                              case '<':
++                                {
++                                  PATFETCH (c);
++                                  if (c == '=')
++                                    /* Positive lookbehind assertion.  */
++                                    shy = lookaround = -1;
++                                  else if (c == '!')
++                                    /* Negative lookbehind assertion.  */
++                                    shy = lookaround = -2;
++                                  else
++                                    FREE_STACK_RETURN (REG_BADPAT);
++                                }
++                                break;
+ 			      default:
+ 				/* Only (?:...) is supported right now. */
+ 				FREE_STACK_RETURN (REG_BADPAT);
+@@ -3235,7 +3326,8 @@
+ 		  = fixup_alt_jump ? fixup_alt_jump - bufp->buffer + 1 : 0;
+ 		COMPILE_STACK_TOP.laststart_offset = b - bufp->buffer;
+ 		COMPILE_STACK_TOP.regnum = regnum;
+-
++                COMPILE_STACK_TOP.lookaround = lookaround;
++                
+ 		/* Do not push a start_memory for groups beyond the last one
+ 		   we can represent in the compiled pattern.  */
+ 		if (regnum <= MAX_REGNUM && regnum > 0)
+@@ -3284,7 +3376,8 @@
+ 		   later groups should continue to be numbered higher,
+ 		   as in `(ab)c(de)' -- the second group is #2.  */
+ 		regnum_t regnum;
+-
++                int lookaround;
++                
+ 		compile_stack.avail--;
+ 		begalt = bufp->buffer + COMPILE_STACK_TOP.begalt_offset;
+ 		fixup_alt_jump
+@@ -3296,13 +3389,40 @@
+ 		/* If we've reached MAX_REGNUM groups, then this open
+ 		   won't actually generate any code, so we'll have to
+ 		   clear pending_exact explicitly.  */
++                lookaround = COMPILE_STACK_TOP.lookaround;
+ 		pending_exact = 0;
+ 
+ 		/* We're at the end of the group, so now we know how many
+ 		   groups were inside this one.  */
+ 		if (regnum <= MAX_REGNUM && regnum > 0)
+ 		  BUF_PUSH_2 (stop_memory, regnum);
+-	      }
++                else if (lookaround)
++                  {
++                    if (lookaround > 0)
++                      {
++                        /* Positive/negative lookahead assertion.  */
++                        GET_BUFFER_SPACE (3);
++                        INSERT_JUMP (lookaround == 1 ? lookahead : lookahead_not, laststart, b + 4);
++                        b += 3;
++                      }
++                    else
++                      {
++                        /* Positive/negative lookbehind assertion.  */
++                        int count = exact_chars_in_pattern_buffer (bufp, laststart, b);
++                        if (count == -1) /* variable length */
++                          FREE_STACK_RETURN (REG_BADPAT);
++
++                        GET_BUFFER_SPACE (5);
++                        INSERT_JUMP2 (lookaround == -1 ? lookbehind : lookbehind_not, laststart, b + 6, count);
++                        b += 5;
++                      }
++                    
++                    /* Negative form.  */
++                    if (lookaround > 1 || lookaround < -1)
++                      BUF_PUSH (lookaround_fail);
++                    BUF_PUSH (lookaround_succeed);
++                  }
++              }
+ 	      break;
+ 
+ 
+@@ -3840,10 +3960,16 @@
+        /* After an alternative?	 */
+     || (*prev == '|' && (syntax & RE_NO_BK_VBAR || prev_prev_backslash))
+        /* After a shy subexpression?  */
+-    || ((syntax & RE_SHY_GROUPS) && prev - 2 >= pattern
+-	&& prev[-1] == '?' && prev[-2] == '('
+-	&& (syntax & RE_NO_BK_PARENS
+-	    || (prev - 3 >= pattern && prev[-3] == '\\')));
++    || ((syntax & RE_SHY_GROUPS)
++        && ((prev - 2 >= pattern
++             && prev[-1] == '?' && prev[-2] == '('
++             && (syntax & RE_NO_BK_PARENS
++                 || (prev - 3 >= pattern && prev[-3] == '\\')))
++         || (prev - 3 >= pattern
++             && (*prev == '=' || *prev == '!')
++             && prev[-1] == '<' && prev[-2] == '?' && prev[-3] == '('
++             && (syntax & RE_NO_BK_PARENS
++                 || (prev - 4 >= pattern && prev[-4] == '\\')))));
+ }
+ 
+ 
+@@ -4079,7 +4205,13 @@
+ 	      match_any_multibyte_characters = true;
+ 	    }
+ 	  break;
+-
++        case lookahead:
++        case lookahead_not:
++        case lookbehind:
++        case lookbehind_not:
++          if (!fastmap) break;
++          return -1;
++          
+       /* All cases after this match the empty string.  These end with
+ 	 `continue'.  */
+ 
+@@ -4706,6 +4838,93 @@
+   return p;
+ }
+ 
++static int
++exact_chars_in_pattern_buffer (bufp, p, pend)
++     struct re_pattern_buffer *bufp;
++     re_char *p, *pend;
++{
++  int count = 0;
++  while (p < pend)
++    {
++      switch (SWITCH_ENUM_CAST ((re_opcode_t) *p++))
++	{
++        case exactn:
++          {
++            int mcnt = *p++;
++            int buf_charlen;
++            while (mcnt > 0) {
++              STRING_CHAR_AND_LENGTH (p, buf_charlen);
++              p += buf_charlen;
++              mcnt -= buf_charlen;
++              count++;
++            }
++          }
++          break;
++        case start_memory:
++        case stop_memory:
++          p++;
++          break;
++#ifdef emacs
++        case categoryspec:
++        case notcategoryspec:
++#endif /* emacs */
++        case syntaxspec:
++        case notsyntaxspec:
++          p++;
++        case anychar:
++          count++;
++          break;
++
++        case charset:
++        case charset_not:
++          if (CHARSET_RANGE_TABLE_EXISTS_P (p - 1))
++            {
++              int mcnt;
++              p = CHARSET_RANGE_TABLE (p - 1);
++              EXTRACT_NUMBER_AND_INCR (mcnt, p);
++              p = CHARSET_RANGE_TABLE_END (p, mcnt);
++            }
++          else
++            p += 1 + CHARSET_BITMAP_SIZE (p - 1);
++          count++;
++          break;
++
++#ifdef emacs
++	case before_dot:
++	case at_dot:
++	case after_dot:
++#endif /* emacs */
++	case no_op:
++	case begline:
++	case endline:
++	case begbuf:
++	case endbuf:
++	case wordbound:
++	case notwordbound:
++	case wordbeg:
++	case wordend:
++	case symbeg:
++	case symend:
++          /* Zero width.  */
++          continue;
++        case lookahead:
++        case lookahead_not:
++        case lookbehind:
++        case lookbehind_not:
++          /* Skip to lookaround_success.  */
++          while (p < pend)
++            {
++              if ((re_opcode_t) *p++ == lookaround_succeed)
++                break;
++            }
++          break;
++        default:
++          return -1;
++        }
++    }
++  return count;
++}
++
+ /* Non-zero if "p1 matches something" implies "p2 fails".  */
+ static int
+ mutually_exclusive_p (struct re_pattern_buffer *bufp, const re_char *p1, const re_char *p2)
+@@ -5049,6 +5268,9 @@
+   re_char **best_regstart, **best_regend;
+ #endif
+ 
++  /* Discard a saved register from the stack.  */
++  boolean discard_saved_regs = 0;
++
+   /* Logically, this is `best_regend[0]'.  But we don't want to have to
+      allocate space for that if we're not allocating space for anything
+      else (see below).  Also, we never need info about register 0 for
+@@ -5621,6 +5843,77 @@
+ 	  p += 1;
+ 	  break;
+ 
++        case lookahead:
++        case lookahead_not:
++          DEBUG_PRINT1 ((re_opcode_t) *(p - 1) == lookahead ? "EXECUTING lookahead.\n" : "EXECUTING lookahead_not.\n");
++
++          p += 2;
++          PUSH_FAILURE_POINT (p - 3, d);
++          break;
++
++        case lookbehind:
++        case lookbehind_not:
++          {
++            int mcnt, count;
++            boolean not = (re_opcode_t) *(p - 1) != lookbehind;
++
++            EXTRACT_NUMBER_AND_INCR (mcnt, p);
++            EXTRACT_NUMBER_AND_INCR (count, p);
++
++            DEBUG_PRINT2 (not
++                          ? "EXECUTING lookbehind_not %d.\n"
++                          : "EXECUTING lookbehind %d.\n", count);
++            
++            dfail = d;
++            while (d != string1 && count > 0)
++              {
++                if (d == string2)
++                  {
++                    if (!string1)
++                      break;
++                    d = end1;
++                    dend = end_match_1;
++                  }
++                
++                if (target_multibyte)
++                  {
++                    re_char *dhead = (d >= string1 && d <= end1) ? string1 : string2;
++                    PREV_CHAR_BOUNDARY (d, dhead);
++                  }
++                else
++                  d--;
++                count--;
++              }
++
++            if (count > 0)
++              {
++                if (not)
++                  {
++                    /* There is no enough string to match.
++                       So just make it succeeded here. */
++                    d = dfail;
++                    p = p - 2 + mcnt;
++                    break;
++                  }
++                else
++                  goto fail;
++              }
++
++            PUSH_FAILURE_POINT (p - 5, dfail);
++          }
++          break;
++
++        case lookaround_succeed:
++          DEBUG_PRINT1 ("EXECUTING lookaround_succeed.\n");
++          
++          FINISH_LOOKAROUND();
++          break;
++
++        case lookaround_fail:
++          DEBUG_PRINT1 ("EXECUTING lookaround_fail.\n");
++          
++          FINISH_LOOKAROUND();
++          goto fail;
+ 
+ 	/* \<digit> has been turned into a `duplicate' command which is
+ 	   followed by the numeric value of <digit> as the register number.  */
+@@ -6269,12 +6562,16 @@
+ 	    case on_failure_jump_loop:
+ 	    case on_failure_jump:
+ 	    case succeed_n:
++            case lookahead_not:
++            case lookbehind_not:
+ 	      d = str;
+ 	    continue_failure_jump:
+ 	      EXTRACT_NUMBER_AND_INCR (mcnt, pat);
+ 	      p = pat + mcnt;
+ 	      break;
+ 
++            case lookahead:
++            case lookbehind:
+ 	    case no_op:
+ 	      /* A special frame used for nastyloops. */
+ 	      goto fail;
